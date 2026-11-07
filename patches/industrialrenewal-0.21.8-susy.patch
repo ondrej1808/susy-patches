@@ -1,0 +1,954 @@
+From de4564f5435cc11b5ee3e82f4dffb39f1f020407 Mon Sep 17 00:00:00 2001
+From: ondrej1808 <o.hlav@post.cz>
+Date: Sat, 7 Nov 2026 12:59:47 +0100
+Subject: [PATCH] Storage Rack/Chest: fix item loss on stacking/breaking,
+ top-face access, chest GUI scroll+search
+
+- TEMultiTankBase: resolve the whole stack at once (correct bottom/top for every member),
+  merge stray contents into the bottom, redistribute contents on break instead of dumping/voiding,
+  client relink after sync
+- MultiStackHandler: never expose/mutate internal stack, robust NBT (legacy byte count), extract max 64
+- Rack shift-extract with full inventory drops instead of voiding
+- Chest container closes when the stack is resized/broken
+- getMaster() only accepts masters whose footprint contains the block
+- Top face opens/inserts; only the same rack is placed on top (stacking)
+- Chest GUI: wheel scroll over slots, search jumps to matching line (Enter = next)
+- Analysis: PATCH_STORAGE_RACK.md
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ PATCH_STORAGE_RACK.md                         |  48 ++++
+ .../blocks/BlockStorage.java                  |  37 ++-
+ .../blocks/BlockStorageChest.java             |  19 +-
+ .../gui/GUIStorageChest.java                  |  62 ++++-
+ .../gui/container/ContainerStorageChest.java  |  21 ++
+ .../tileentity/TEStorage.java                 |  51 +++-
+ .../tileentity/TEStorageChest.java            |  59 ++++-
+ .../tileentity/abstracts/TEMultiTankBase.java | 243 +++++++++++++-----
+ .../abstracts/TileEntityMultiBlockBase.java   |   3 +-
+ .../util/MultiStackHandler.java               |  48 +++-
+ 10 files changed, 519 insertions(+), 72 deletions(-)
+ create mode 100644 PATCH_STORAGE_RACK.md
+
+diff --git a/PATCH_STORAGE_RACK.md b/PATCH_STORAGE_RACK.md
+new file mode 100644
+index 00000000..c2c331f1
+--- /dev/null
++++ b/PATCH_STORAGE_RACK.md
+@@ -0,0 +1,48 @@
++# Storage Rack / Storage Chest – analýza a patch (IR 0.21.8, SuSy 0.2.0.1-patch2)
++
++## Model
++Každý rack (3×3×2… výška 3 bloky) má master TE. Racky na sobě (master přesně o 3 bloky výš) tvoří „stack“.
++Sdílený obsah drží **jen spodní** člen (`bottomTE`), ten se zvětší na `n × kapacita`.
++Ostatní členové přes `getBottomTE()` posílají insert/extract/GUI/capability na spodní.
++
++## Nalezené chyby (původní kód)
++| # | Kde | Chyba | Důsledek |
++|---|-----|-------|----------|
++| 1 | `TEMultiTankBase.passValueDown/checkSize` | Prostřední členové nedostanou nový `bottomTE`; nový spodní člen si nastaví `bottomTE` jen v jedné větvi | Po zničení spodního racku ve stacku ≥3 ukazují zbylé racky na **zničený TE** → vložené itemy (ruka, hopper, Crafting Station) **mizí** |
++| 2 | `checkSize` | Horní člen si nikdy nevynuluje `isBottom` | Rack pod/mezi existující: obsah starého spodního se „osiřel“ (neviditelný), TESR ukazuje 2 popisky |
++| 3 | `TEStorage.onMasterBreak` | Zničení spodního = vysype **celý** sdílený obsah na zem (za rack, offset 2) | Tisíce item entit, despawn po 5 min, často ve zdi |
++| 4 | `TEStorageChest.onMasterBreak` | Totéž pro chest (vysype všech 198+ slotů) | dtto |
++| 5 | rozdělení stacku | Spodní část se zmenší přes `setSize` → přebytek se vysype, horní část je prázdná | Ztráta / rozházení itemů |
++| 6 | klient | `onMasterBreak` jen na serveru → klientské `bottomTE` zůstanou na mrtvém TE | Rack vypadá prázdný, GUI se neotevře |
++| 7 | `MultiStackHandler.getStackInSlot` | Vrací a **mutuje interní stack** (i `ItemStack.EMPTY`) | Mod, který stack upraví, nebo uložení při počtu 0 → ztráta typu itemu → **celý obsah zmizí** po reloadu |
++| 8 | `MultiStackHandler` NBT | Počet se ukládá do bytu (`Count`) → 256 = 0 = „prázdný“ | Zdroj #7 |
++| 9 | `MultiStackHandler.extractItem` | Vydá až `maxStack` (4096×n) najednou, ne max 64 | Mod/hopper může přijmout jen část → zbytek voidnut |
++| 10 | `TEStorage.onActivated` (shift-klik) | Při plném inventáři hráče se vytažený stack zahodí do voidu | Ztráta 64 itemů |
++| 11 | `ContainerStorageChest` | Sloty postavené pro starou velikost; při přidání/odebrání racku s otevřeným GUI | Crash / zápis do špatných slotů |
++| 12 | `TileEntityMultiBlockBase.getMaster` | Hledá master v 3×3×3 bez kontroly, že ho footprint obsahuje | Rozbití racku může rozbít **sousední** rack (do hloubky) |
++| 13 | `Block*.onBlockActivated` | Horní strana zakázaná | Nejde otevřít shora |
++
++Ostatní postřehy (neopraveno): `search`/`currentLine` chestu jsou sdílené pro všechny hráče; racky s různou orientací se na sebe spojí (jen podle masteru).
++
++## Patch
++- `TEMultiTankBase`: celý stack se vždy přepočítá najednou (`relinkStack`) – správné `bottomTE/topTE/isBottom/isTop` pro všechny členy; obsah nespodních členů se přesune do spodního (opravuje i staré světy s osiřelými itemy při načtení).
++- Zničení: obsah se nejdřív vyjme, stack se rozdělí, obsah se vrátí do spodní části, pak horní, zbytek se vysype na místě zničeného racku.
++- Klient: po každém sync paketu přepočet stacku (`relinkPending`).
++- `MultiStackHandler`: interní stack = jen typ (count 1), `getStackInSlot` vrací kopii; oprava starých NBT; extract max 64; vyčištění při 0.
++- Shift-klik s plným inventářem → drop místo voidu.
++- Chest GUI se zavře, když se stack změní/zničí.
++- `getMaster` kontroluje footprint.
++- Horní strana: otevře/vloží; položí se jen stejný rack (stavění stacku).
++
++Dotčeno i `TEFluidTank` a `TEIndustrialBatteryBank` (stejný základ) – jen oprava odkazů, přenos tekutin/energie neimplementován.
++
++## Testovací scénáře
++1. Rack s itemy + rack nahoru → počet zůstane, kapacita ×2, popisek jen dole.
++2. Stack 3 → zničit spodní → itemy v nové spodní části, nic na zemi (pokud se vejde).
++3. Stack 3 → zničit prostřední → spodní drží co se vejde, zbytek nahoře, zbytek na zemi.
++4. Stack 3 → zničit horní → přebytek nad kapacitu na zemi.
++5. Po kroku 2 vkládat do racků (ruka, hopper, Crafting Station) → nic nemizí.
++6. Uložit + reload → obsah sedí.
++7. Chest: otevřené GUI a jiný hráč přidá/zničí rack → GUI se zavře, bez crashe.
++8. Shift-klik prázdnou rukou s plným inventářem → stack padne na zem.
++9. Shora klik prázdnou rukou / itemem → otevře / vloží; s rackem v ruce → postaví.
+diff --git a/src/main/java/cassiokf/industrialrenewal/blocks/BlockStorage.java b/src/main/java/cassiokf/industrialrenewal/blocks/BlockStorage.java
+index d2b82f00..33812c6e 100644
+--- a/src/main/java/cassiokf/industrialrenewal/blocks/BlockStorage.java
++++ b/src/main/java/cassiokf/industrialrenewal/blocks/BlockStorage.java
+@@ -9,6 +9,7 @@ import net.minecraft.block.state.IBlockState;
+ import net.minecraft.creativetab.CreativeTabs;
+ import net.minecraft.entity.EntityLivingBase;
+ import net.minecraft.entity.player.EntityPlayer;
++import net.minecraft.item.ItemBlock;
+ import net.minecraft.item.ItemStack;
+ import net.minecraft.tileentity.TileEntity;
+ import net.minecraft.util.EnumFacing;
+@@ -29,13 +30,47 @@ public class BlockStorage extends BlockMultiTankBase<TEStorage>
+     @Override
+     public boolean onBlockActivated(World worldIn, BlockPos pos, IBlockState state, EntityPlayer playerIn, EnumHand hand, EnumFacing facing, float hitX, float hitY, float hitZ)
+     {
+-        if (facing == EnumFacing.UP) return false;
++        // patch: the top face works like the sides, except when placing a block on top (stacking)
++        if (isPlacingOnTop(facing, playerIn, hand)
++                && !rackHolds(worldIn, pos, playerIn.getHeldItem(hand))) return false;
+         TileEntity te = worldIn.getTileEntity(pos);
+         if (te instanceof TEStorage)
+             return ((TEStorage) te).getMaster().getBottomTE().onActivated(playerIn, hand, facing);
+         return false;
+     }
+ 
++    /**
++     * Whether a click on the top face should be passed through so the held block gets placed
++     * (needed to stack another rack on top). Any other click on the top face opens/uses the rack.
++     *
++     * @param facing clicked face
++     * @param player clicking player
++     * @param hand   used hand
++     * @return {@code true} if the player clicks the top face holding this rack's item (stacking wins)
++     */
++    private static boolean isPlacingOnTop(EnumFacing facing, EntityPlayer player, EnumHand hand)
++    {
++        return facing == EnumFacing.UP && player.getHeldItem(hand).getItem() instanceof ItemBlock
++                && ((ItemBlock) player.getHeldItem(hand).getItem()).getBlock() instanceof BlockStorage;
++    }
++
++    /**
++     * Whether the rack at {@code pos} already stores exactly the held item, in which case a top click
++     * should insert it instead of placing it.
++     *
++     * @param world world
++     * @param pos   clicked block position
++     * @param held  held stack
++     * @return {@code true} if the rack contents match the held item
++     */
++    private static boolean rackHolds(World world, BlockPos pos, ItemStack held)
++    {
++        TileEntity te = world.getTileEntity(pos);
++        if (!(te instanceof TEStorage)) return false;
++        TEStorage bottom = ((TEStorage) te).getMaster().getBottomTE();
++        return bottom.getCount() > 0 && bottom.getStack().getItem() == held.getItem();
++    }
++
+     @Override
+     public List<BlockPos> getMachineBlockPosList(BlockPos masterPos, EnumFacing facing)
+     {
+diff --git a/src/main/java/cassiokf/industrialrenewal/blocks/BlockStorageChest.java b/src/main/java/cassiokf/industrialrenewal/blocks/BlockStorageChest.java
+index 897e0331..3d598db2 100644
+--- a/src/main/java/cassiokf/industrialrenewal/blocks/BlockStorageChest.java
++++ b/src/main/java/cassiokf/industrialrenewal/blocks/BlockStorageChest.java
+@@ -9,6 +9,7 @@ import net.minecraft.block.state.IBlockState;
+ import net.minecraft.creativetab.CreativeTabs;
+ import net.minecraft.entity.EntityLivingBase;
+ import net.minecraft.entity.player.EntityPlayer;
++import net.minecraft.item.ItemBlock;
+ import net.minecraft.item.ItemStack;
+ import net.minecraft.tileentity.TileEntity;
+ import net.minecraft.util.EnumFacing;
+@@ -29,12 +30,28 @@ public class BlockStorageChest extends BlockMultiTankBase<TEStorageChest>
+     @Override
+     public boolean onBlockActivated(World worldIn, BlockPos pos, IBlockState state, EntityPlayer playerIn, EnumHand hand, EnumFacing facing, float hitX, float hitY, float hitZ)
+     {
+-        if (facing == EnumFacing.UP) return false;
++        // patch: the top face opens the GUI too, except when placing a block on top (stacking)
++        if (isPlacingOnTop(facing, playerIn, hand)) return false;
+         TileEntity te = worldIn.getTileEntity(pos);
+         if (te instanceof TEStorageChest) ((TEStorageChest) te).getMaster().getBottomTE().openGui(playerIn, true);
+         return true;
+     }
+ 
++    /**
++     * Whether a click on the top face should be passed through so the held block gets placed
++     * (needed to stack another rack on top). Any other click on the top face opens/uses the rack.
++     *
++     * @param facing clicked face
++     * @param player clicking player
++     * @param hand   used hand
++     * @return {@code true} if the player clicks the top face holding this rack's item (stacking wins)
++     */
++    private static boolean isPlacingOnTop(EnumFacing facing, EntityPlayer player, EnumHand hand)
++    {
++        return facing == EnumFacing.UP && player.getHeldItem(hand).getItem() instanceof ItemBlock
++                && ((ItemBlock) player.getHeldItem(hand).getItem()).getBlock() instanceof BlockStorageChest;
++    }
++
+     @Override
+     public List<BlockPos> getMachineBlockPosList(BlockPos masterPos, EnumFacing facing)
+     {
+diff --git a/src/main/java/cassiokf/industrialrenewal/gui/GUIStorageChest.java b/src/main/java/cassiokf/industrialrenewal/gui/GUIStorageChest.java
+index 3de8aed1..09b8a4e9 100644
+--- a/src/main/java/cassiokf/industrialrenewal/gui/GUIStorageChest.java
++++ b/src/main/java/cassiokf/industrialrenewal/gui/GUIStorageChest.java
+@@ -32,6 +32,8 @@ public class GUIStorageChest extends GUIBase
+     private GuiButton downB;
+     private GuiTextField searchField;
+     private boolean skip;
++    /** search text the current page was last positioned for */
++    private String lastSearch = "";
+ 
+     public GUIStorageChest(IInventory playerInv, TEStorageChest te)
+     {
+@@ -77,6 +79,7 @@ public class GUIStorageChest extends GUIBase
+         searchField.setVisible(true);
+         searchField.setFocused(te.searchActive);
+         skip = false;
++        lastSearch = te.search;
+     }
+ 
+     public void onKeyboardEvent(GuiScreenEvent.KeyboardInputEvent event)
+@@ -99,6 +102,13 @@ public class GUIStorageChest extends GUIBase
+                         event.setCanceled(true);
+                         skip = false;
+                     }
++                    else if (keyCode == 28 && !searchField.getText().isEmpty())
++                    {
++                        // patch: Enter jumps to the next line containing a match
++                        jumpToMatch(te.currentLine + 1);
++                        event.setCanceled(true);
++                        skip = true;
++                    }
+                     else if (keyCode == 28 || keyCode == 1)
+                     {
+                         searchField.setFocused(false);
+@@ -153,6 +163,12 @@ public class GUIStorageChest extends GUIBase
+         searchField.drawTextBox();
+         te.search = searchField.getText();
+         te.searchActive = searchField.isFocused();
++        if (!te.search.equals(lastSearch))
++        {
++            lastSearch = te.search;
++            // patch: jump to the first match unless one is already on the visible page
++            if (!te.search.isEmpty() && !hasMatchOnPage()) jumpToMatch(0);
++        }
+ 
+         for (Slot s : inventorySlots.inventorySlots)
+         {
+@@ -203,7 +219,7 @@ public class GUIStorageChest extends GUIBase
+         upB.enabled = te.currentLine > 0;
+         downB.enabled = te.currentLine < te.additionalLines;
+ 
+-        if (isPointInRegion(205, 6, 10, 108, mouseX, mouseY))
++        if (isPointInRegion(0, 14, 216, 112, mouseX, mouseY))
+         {
+             int scroll = Mouse.getDWheel();
+             if (scroll > 0) scrollPressed(true);
+@@ -219,6 +235,50 @@ public class GUIStorageChest extends GUIBase
+         }
+     }
+ 
++    /**
++     * Whether a slot on the currently shown page matches the search text.
++     *
++     * @return {@code true} if a visible slot holds a matching item
++     */
++    private boolean hasMatchOnPage()
++    {
++        int first = te.currentLine * 11;
++        int last = first + 6 * 11;
++        for (int i = first; i < last && i < te.inventory.getSlots(); i++)
++        {
++            ItemStack s = te.inventory.getStackInSlot(i);
++            if (!s.isEmpty() && stackMatches(te.search, s)) return true;
++        }
++        return false;
++    }
++
++    /**
++     * Scrolls to the first line at or after {@code fromLine} (wrapping) that contains a matching item.
++     *
++     * @param fromLine line to start searching at
++     */
++    private void jumpToMatch(int fromLine)
++    {
++        int lines = (te.inventory.getSlots() + 10) / 11;
++        if (lines <= 0) return;
++        for (int n = 0; n < lines; n++)
++        {
++            int line = (fromLine + n) % lines;
++            for (int x = 0; x < 11; x++)
++            {
++                int i = line * 11 + x;
++                if (i >= te.inventory.getSlots()) break;
++                ItemStack s = te.inventory.getStackInSlot(i);
++                if (!s.isEmpty() && stackMatches(te.search, s))
++                {
++                    int target = Math.min(line, te.additionalLines);
++                    if (target != te.currentLine) sendToServer(TEStorageChest.LINE_JUMP_BASE + target);
++                    return;
++                }
++            }
++        }
++    }
++
+     public void scrollPressed(boolean up)
+     {
+         if (up && upB.enabled) sendToServer(upB.id);
+diff --git a/src/main/java/cassiokf/industrialrenewal/gui/container/ContainerStorageChest.java b/src/main/java/cassiokf/industrialrenewal/gui/container/ContainerStorageChest.java
+index f4e88e3a..cc39a56a 100644
+--- a/src/main/java/cassiokf/industrialrenewal/gui/container/ContainerStorageChest.java
++++ b/src/main/java/cassiokf/industrialrenewal/gui/container/ContainerStorageChest.java
+@@ -1,16 +1,23 @@
+ package cassiokf.industrialrenewal.gui.container;
+ 
+ import cassiokf.industrialrenewal.tileentity.TEStorageChest;
++import net.minecraft.entity.player.EntityPlayer;
+ import net.minecraft.inventory.IInventory;
+ import net.minecraftforge.items.IItemHandler;
+ import net.minecraftforge.items.SlotItemHandler;
+ 
+ public class ContainerStorageChest extends ContainerBase
+ {
++    private final TEStorageChest te;
++    private final IItemHandler builtFor;
++    private final int builtSlots;
+ 
+     public ContainerStorageChest(IInventory playerInv, TEStorageChest te)
+     {
+         IItemHandler inventory = te.inventory; //Gets the inventory from our tile entity
++        this.te = te;
++        this.builtFor = inventory;
++        this.builtSlots = inventory.getSlots();
+         int startIndex = te.currentLine * 11;
+         int numRows = inventory.getSlots() / 11;
+         int limit = 0;
+@@ -34,4 +41,18 @@ public class ContainerStorageChest extends ContainerBase
+         }
+         drawPlayerInv(playerInv, 45, 18);
+     }
++
++    /**
++     * Patch: the GUI closes when the rack is broken or the stack is resized (rack added/removed),
++     * because the slots were built for the old inventory size (stale slots crashed / mis-addressed items).
++     *
++     * @param player player using the container
++     * @return {@code false} when the container must be closed
++     */
++    @Override
++    public boolean canInteractWith(EntityPlayer player)
++    {
++        return super.canInteractWith(player) && !te.isInvalid() && te.inventory == builtFor
++                && te.inventory.getSlots() == builtSlots;
++    }
+ }
+diff --git a/src/main/java/cassiokf/industrialrenewal/tileentity/TEStorage.java b/src/main/java/cassiokf/industrialrenewal/tileentity/TEStorage.java
+index b2572b0f..ff48c07e 100644
+--- a/src/main/java/cassiokf/industrialrenewal/tileentity/TEStorage.java
++++ b/src/main/java/cassiokf/industrialrenewal/tileentity/TEStorage.java
+@@ -14,6 +14,7 @@ import net.minecraft.util.math.BlockPos;
+ import net.minecraftforge.common.capabilities.Capability;
+ import net.minecraftforge.items.CapabilityItemHandler;
+ 
++import java.util.ArrayList;
+ import java.util.List;
+ 
+ public class TEStorage extends TEMultiTankBase<TEStorage>
+@@ -29,9 +30,10 @@ public class TEStorage extends TEMultiTankBase<TEStorage>
+             if (!world.isRemote)
+             {
+                 ItemStack itemsIn = inventory.extractItem(inventory.getStackInSlot(0).getMaxStackSize());
+-                if (!itemsIn.isEmpty())
++                if (!itemsIn.isEmpty() && !playerIn.addItemStackToInventory(itemsIn) && !itemsIn.isEmpty())
+                 {
+-                    playerIn.addItemStackToInventory(itemsIn);
++                    // patch: full player inventory used to void the extracted stack
++                    playerIn.dropItem(itemsIn, false);
+                 }
+             }
+             return true;
+@@ -69,8 +71,51 @@ public class TEStorage extends TEMultiTankBase<TEStorage>
+     @Override
+     public void onMasterBreak()
+     {
++        // contents are moved to the remaining stack parts / dropped by TEMultiTankBase
+         super.onMasterBreak();
+-        if (isBottom() && inventory.getCount() > 0) spawnItems(inventory.getCount());
++        if (inventory.getCount() > 0) spawnItems(inventory.getCount());
++    }
++
++    /**
++     * Empties this rack's own storage.
++     *
++     * @return stored items split into max-size stacks
++     */
++    @Override
++    public List<ItemStack> extractAllContents()
++    {
++        List<ItemStack> out = new ArrayList<>();
++        ItemStack all = inventory.extractAll();
++        if (all.isEmpty()) return out;
++        int left = all.getCount();
++        int max = Math.max(1, all.getMaxStackSize());
++        while (left > 0)
++        {
++            int n = Math.min(left, max);
++            ItemStack part = all.copy();
++            part.setCount(n);
++            out.add(part);
++            left -= n;
++        }
++        return out;
++    }
++
++    /**
++     * Inserts stacks into this rack's own storage (single item type).
++     *
++     * @param stacks stacks to insert
++     * @return stacks (or remainders) that did not fit or are a different item
++     */
++    @Override
++    public List<ItemStack> insertContents(List<ItemStack> stacks)
++    {
++        List<ItemStack> left = new ArrayList<>();
++        for (ItemStack s : stacks)
++        {
++            ItemStack rest = inventory.insertItem(s.copy());
++            if (!rest.isEmpty()) left.add(rest);
++        }
++        return left;
+     }
+ 
+     private void spawnItems(int quantity)
+diff --git a/src/main/java/cassiokf/industrialrenewal/tileentity/TEStorageChest.java b/src/main/java/cassiokf/industrialrenewal/tileentity/TEStorageChest.java
+index d9825539..7255baf4 100644
+--- a/src/main/java/cassiokf/industrialrenewal/tileentity/TEStorageChest.java
++++ b/src/main/java/cassiokf/industrialrenewal/tileentity/TEStorageChest.java
+@@ -16,6 +16,9 @@ import net.minecraft.util.math.BlockPos;
+ import net.minecraftforge.common.capabilities.Capability;
+ import net.minecraftforge.items.CapabilityItemHandler;
+ 
++import net.minecraftforge.items.ItemHandlerHelper;
++
++import java.util.ArrayList;
+ import java.util.List;
+ 
+ public class TEStorageChest extends TEMultiTankBase<TEStorageChest>
+@@ -46,9 +49,22 @@ public class TEStorageChest extends TEMultiTankBase<TEStorageChest>
+         return MachinesUtils.getBlocksIn3x3x2Centered(centerPosition, getMasterFacing());
+     }
+ 
++    /** button ids >= this jump directly to line (id - LINE_JUMP_BASE); used by search */
++    public static final int LINE_JUMP_BASE = 100;
++
++    /**
++     * Handles GUI navigation: 1 = line up, 2 = line down, >= {@link #LINE_JUMP_BASE} = jump to a line.
++     *
++     * @param id     button id
++     * @param player player to reopen the GUI for (null on client)
++     */
+     public void guiButtonClick(int id, EntityPlayer player)
+     {
+-        if (id == 1 && currentLine > 0)
++        if (id >= LINE_JUMP_BASE)
++        {
++            currentLine = Math.max(0, Math.min(additionalLines, id - LINE_JUMP_BASE));
++        }
++        else if (id == 1 && currentLine > 0)
+         {
+             currentLine--;
+         }
+@@ -96,10 +112,51 @@ public class TEStorageChest extends TEMultiTankBase<TEStorageChest>
+     @Override
+     public void onMasterBreak()
+     {
++        // contents are moved to the remaining stack parts / dropped by TEMultiTankBase; this only drops
++        // anything that is still left (normally nothing)
+         super.onMasterBreak();
+         Utils.dropInventoryItems(world, pos, inventory);
+     }
+ 
++    /**
++     * Empties this chest's own inventory.
++     *
++     * @return removed stacks
++     */
++    @Override
++    public List<ItemStack> extractAllContents()
++    {
++        List<ItemStack> out = new ArrayList<>();
++        for (int i = 0; i < inventory.getSlots(); i++)
++        {
++            ItemStack s = inventory.getStackInSlot(i);
++            if (!s.isEmpty())
++            {
++                out.add(s.copy());
++                inventory.setStackInSlot(i, ItemStack.EMPTY);
++            }
++        }
++        return out;
++    }
++
++    /**
++     * Inserts stacks into this chest's own inventory, stacking onto existing stacks first.
++     *
++     * @param stacks stacks to insert
++     * @return stacks (or remainders) that did not fit
++     */
++    @Override
++    public List<ItemStack> insertContents(List<ItemStack> stacks)
++    {
++        List<ItemStack> left = new ArrayList<>();
++        for (ItemStack s : stacks)
++        {
++            ItemStack rest = ItemHandlerHelper.insertItemStacked(inventory, s.copy(), false);
++            if (!rest.isEmpty()) left.add(rest);
++        }
++        return left;
++    }
++
+     private void spawnItems(ItemStack stack)
+     {
+         if (!stack.isEmpty()) Utils.spawnItemStack(world, pos.offset(getMasterFacing().getOpposite(), 2), stack);
+diff --git a/src/main/java/cassiokf/industrialrenewal/tileentity/abstracts/TEMultiTankBase.java b/src/main/java/cassiokf/industrialrenewal/tileentity/abstracts/TEMultiTankBase.java
+index cab68412..710efbc5 100644
+--- a/src/main/java/cassiokf/industrialrenewal/tileentity/abstracts/TEMultiTankBase.java
++++ b/src/main/java/cassiokf/industrialrenewal/tileentity/abstracts/TEMultiTankBase.java
+@@ -1,20 +1,40 @@
+ package cassiokf.industrialrenewal.tileentity.abstracts;
+ 
+ import cassiokf.industrialrenewal.util.MachinesUtils;
++import cassiokf.industrialrenewal.util.Utils;
++import net.minecraft.item.ItemStack;
+ import net.minecraft.nbt.NBTTagCompound;
+ import net.minecraft.tileentity.TileEntity;
+ import net.minecraft.util.math.BlockPos;
+ 
+ import java.util.ArrayList;
++import java.util.Collections;
+ import java.util.List;
+ 
++/**
++ * Base for vertically stackable multiblocks (tanks, storage racks, battery banks).
++ * Masters stacked exactly 3 blocks apart form one "stack"; only the BOTTOM member holds the shared
++ * contents and is resized to {@code n * capacity}.
++ * <p>
++ * Patched: the stack is now always re-resolved as a whole ({@link #relinkStack()}), so every member gets
++ * correct {@code bottomTE/topTE/isBottom/isTop} (previously intermediate members kept stale pointers to
++ * destroyed TEs, which voided inserted items). Contents of members that stop being the bottom are moved
++ * into the new bottom, and on break the contents are redistributed instead of being dumped/lost.
++ */
+ public abstract class TEMultiTankBase<T extends TEMultiTankBase> extends TileEntityMultiBlockBase<T>
+ {
++    /** vertical distance between masters of two stacked multiblocks */
++    protected static final int STACK_SPACING = 3;
++
+     protected final List<T> machines = new ArrayList<>();
+     public T bottomTE = (T) this;
+     public T topTE = (T) this;
+     private boolean isBottom = false;
+     private boolean isTop = false;
++    /** client only: a data packet arrived, re-resolve the stack on the next tick */
++    private boolean relinkPending = false;
++    /** client only: last stack size applied via setSize, to avoid resetting client GUI state each packet */
++    private int lastClientSize = -1;
+ 
+     @Override
+     public List<BlockPos> getListOfBlockPositions(BlockPos centerPosition)
+@@ -22,92 +42,180 @@ public abstract class TEMultiTankBase<T extends TEMultiTankBase> extends TileEnt
+         return MachinesUtils.getBlocksIn3x3x3Centered(centerPosition);
+     }
+ 
++    /**
++     * Ticks the TE and, on the client, applies a pending stack relink requested by a data packet.
++     *
++     * @return nothing
++     */
+     @Override
+-    public void onFirstTick()
++    public void update()
+     {
+-        if (isMaster())
++        super.update();
++        if (relinkPending && world != null && world.isRemote && isMaster())
+         {
+-            reachTop();
++            relinkPending = false;
++            relinkStack();
+         }
+     }
+ 
+     @Override
+-    public void onMasterBreak()
++    public void onFirstTick()
+     {
+-        if (world.isRemote) return;
+-        this.invalidate();
+-        TileEntity upTE = world.getTileEntity(pos.up(3));
+-        if (instanceOf(upTE) && !upTE.isInvalid() && ((TEMultiTankBase) upTE).isMaster())
++        if (isMaster())
+         {
+-            ((T) upTE).setBottom(true);
+-            ((T) upTE).reachTop();
++            relinkStack();
+         }
+-        TileEntity downTE = world.getTileEntity(pos.down(3));
+-        if (instanceOf(downTE) && !downTE.isInvalid() && ((TEMultiTankBase) downTE).isMaster())
++    }
++
++    /**
++     * Returns the valid stacked master TE at the given offset (in stack steps) from this one.
++     *
++     * @param from  member to start from
++     * @param steps +1 = next above, -1 = next below
++     * @return neighbour master TE, or {@code null} if there is none / it is invalid
++     */
++    @SuppressWarnings("unchecked")
++    private T neighbour(TEMultiTankBase<?> from, int steps)
++    {
++        TileEntity te = world.getTileEntity(from.pos.up(STACK_SPACING * steps));
++        if (instanceOf(te) && !te.isInvalid() && ((TEMultiTankBase<?>) te).isMaster()) return (T) te;
++        return null;
++    }
++
++    /**
++     * Collects all members of the stack this TE belongs to, bottom first. Invalid (broken) TEs are skipped
++     * and therefore split the stack.
++     *
++     * @return ordered member list (never empty: contains at least this TE)
++     */
++    @SuppressWarnings("unchecked")
++    public List<T> collectStack()
++    {
++        T bottom = (T) this;
++        T below;
++        while ((below = neighbour(bottom, -1)) != null) bottom = below;
++        List<T> list = new ArrayList<>();
++        T current = bottom;
++        while (current != null)
+         {
+-            ((T) downTE).setTop(true);
+-            ((T) downTE).sync();
++            list.add(current);
++            current = neighbour(current, 1);
+         }
++        return list;
+     }
+ 
+-    public void checkSize(T top)
++    /**
++     * Re-resolves the whole stack this TE is part of: sets bottom/top flags and pointers on every member,
++     * resizes the bottom and (server side) moves contents of non-bottom members into the bottom.
++     *
++     * @return nothing; syncs all members to clients (server side)
++     */
++    public void relinkStack()
+     {
+-        TileEntity te = world.getTileEntity(pos.down(3));
+-        top.machines.clear();
+-        top.machines.add(this);
+-        if (instanceOf(te) && !te.isInvalid() && ((TEMultiTankBase) te).isMaster())
++        if (world == null || isInvalid()) return;
++        List<T> stack = collectStack();
++        T bottom = stack.get(0);
++        T top = stack.get(stack.size() - 1);
++        for (int i = 0; i < stack.size(); i++)
+         {
+-            bottomTE = (T) ((T) te).passValueDown(1, top);
++            TEMultiTankBase<T> member = stack.get(i);
++            member.isBottom = i == 0;
++            member.isTop = i == stack.size() - 1;
++            member.bottomTE = bottom;
++            member.topTE = top;
+         }
+-        else
++        bottom.machines.clear();
++        bottom.machines.addAll(stack);
++        top.machines.clear();
++        top.machines.addAll(stack);
++
++        if (!world.isRemote)
+         {
+-            isBottom = true;
+-            bottomTE = (T) this;
+-            topTE = top;
++            bottom.setSize(stack.size());
++            // contents that ended up in a non-bottom member (old saves, merged stacks) go to the bottom
++            for (int i = 1; i < stack.size(); i++)
++            {
++                T member = stack.get(i);
++                List<ItemStack> leftovers = bottom.insertContents(member.extractAllContents());
++                for (ItemStack stack1 : leftovers) Utils.spawnItemStack(world, member.getPos(), stack1);
++            }
++            for (T member : stack) member.sync();
+         }
+-
+-        if (isBottom)
++        else if (((TEMultiTankBase<?>) bottom).lastClientSize != stack.size())
+         {
+-            setSize(1);
+-            topTE = top;
++            ((TEMultiTankBase<?>) bottom).lastClientSize = stack.size();
++            bottom.setSize(stack.size());
+         }
+-        sync();
+     }
+ 
+-    public abstract void setSize(int i);
++    @Override
++    public void onMasterBreak()
++    {
++        if (world.isRemote) return;
++        // take everything out of the shared storage before the stack is split/resized, so nothing is dropped
++        // by setSize() and nothing is left in a destroyed TE
++        List<ItemStack> pool = new ArrayList<>();
++        T oldBottom = getBottomTE();
++        if (oldBottom != null && oldBottom != this && !oldBottom.isInvalid())
++            pool.addAll(oldBottom.extractAllContents());
++        pool.addAll(this.extractAllContents());
++
++        T below = neighbour(this, -1);
++        T above = neighbour(this, 1);
++        this.invalidate();
++
++        if (below != null) below.relinkStack();
++        if (above != null) above.relinkStack();
++
++        // refill: lower part first (that is where the stored items physically were), then the upper part
++        if (below != null) pool = below.getBottomTE().insertContents(pool);
++        if (above != null) pool = above.getBottomTE().insertContents(pool);
++        for (ItemStack stack : pool) Utils.spawnItemStack(world, pos, stack);
++        if (below != null) below.getBottomTE().sync();
++        if (above != null) above.getBottomTE().sync();
++    }
+ 
+-    public TEMultiTankBase passValueDown(int i, T top)
++    /**
++     * Removes and returns all item contents stored in THIS TE's own storage (not the shared one).
++     * Default: no item contents.
++     *
++     * @return removed stacks (each at most its max stack size); empty list if nothing
++     */
++    public List<ItemStack> extractAllContents()
+     {
+-        top.machines.add(this);
+-        TileEntity te = world.getTileEntity(pos.down(3));
+-        if (instanceOf(te) && !te.isInvalid() && ((TEMultiTankBase) te).isMaster())
+-        {
+-            isBottom = false;
+-            sync();
+-            return ((T) te).passValueDown(i + 1, top);
+-        }
+-        else
+-        {
+-            isBottom = true;
+-            topTE = top;
+-            setSize(i + 1);
+-            return this;
+-        }
++        return Collections.emptyList();
+     }
+ 
++    /**
++     * Inserts stacks into THIS TE's own storage as far as they fit.
++     * Default: accepts nothing.
++     *
++     * @param stacks stacks to insert (not modified)
++     * @return stacks that did not fit
++     */
++    public List<ItemStack> insertContents(List<ItemStack> stacks)
++    {
++        return stacks;
++    }
++
++    /**
++     * Legacy entry point (kept for subclasses): re-resolves the stack.
++     *
++     * @param top ignored
++     */
++    public void checkSize(T top)
++    {
++        relinkStack();
++    }
++
++    public abstract void setSize(int i);
++
++    /**
++     * Legacy entry point (kept for subclasses, e.g. battery bank after adding a battery): re-resolves the stack.
++     */
+     public void reachTop()
+     {
+-        TileEntity te = world.getTileEntity(pos.up(3));
+-        if (instanceOf(te) && !te.isInvalid() && ((TEMultiTankBase) te).isMaster())
+-        {
+-            isTop = false;
+-            ((TEMultiTankBase<?>) te).reachTop();
+-        }
+-        else
+-        {
+-            isTop = true;
+-            checkSize((T) this);
+-        }
++        relinkStack();
+     }
+ 
+     public T getBottomTE()
+@@ -120,11 +228,14 @@ public abstract class TEMultiTankBase<T extends TEMultiTankBase> extends TileEnt
+         return topTE;
+     }
+ 
++    /**
++     * Legacy setter; the flag is now derived by {@link #relinkStack()}, which this triggers.
++     *
++     * @param value ignored
++     */
+     public void setTop(boolean value)
+     {
+-        isTop = value;
+-        if (isTop) checkSize((T) this);
+-        else reachTop();
++        relinkStack();
+     }
+ 
+     public boolean isBottom()
+@@ -132,6 +243,11 @@ public abstract class TEMultiTankBase<T extends TEMultiTankBase> extends TileEnt
+         return isBottom;
+     }
+ 
++    /**
++     * Legacy setter; the flag is now derived by {@link #relinkStack()}.
++     *
++     * @param value new flag value
++     */
+     public void setBottom(boolean value)
+     {
+         isBottom = value;
+@@ -145,11 +261,18 @@ public abstract class TEMultiTankBase<T extends TEMultiTankBase> extends TileEnt
+         return super.writeToNBT(compound);
+     }
+ 
++    /**
++     * Reads flags from NBT; on the client a received update schedules a stack relink (the client never sees
++     * the server's break/merge logic, so its pointers would otherwise go stale).
++     *
++     * @param compound saved/synced data
++     */
+     @Override
+     public void readFromNBT(NBTTagCompound compound)
+     {
+         isBottom = compound.getBoolean("bottom");
+         isTop = compound.getBoolean("isTop");
+         super.readFromNBT(compound);
++        if (world != null && world.isRemote) relinkPending = true;
+     }
+ }
+diff --git a/src/main/java/cassiokf/industrialrenewal/tileentity/abstracts/TileEntityMultiBlockBase.java b/src/main/java/cassiokf/industrialrenewal/tileentity/abstracts/TileEntityMultiBlockBase.java
+index 777718c4..0ea27c75 100644
+--- a/src/main/java/cassiokf/industrialrenewal/tileentity/abstracts/TileEntityMultiBlockBase.java
++++ b/src/main/java/cassiokf/industrialrenewal/tileentity/abstracts/TileEntityMultiBlockBase.java
+@@ -60,7 +60,8 @@ public abstract class TileEntityMultiBlockBase<TE extends TileEntityMultiBlockBa
+                 TileEntity te = world.getTileEntity(currentPos);
+                 if (te instanceof TileEntityMultiBlockBase
+                         && ((TileEntityMultiBlockBase) te).isMaster()
+-                        && instanceOf(te))
++                        && instanceOf(te)
++                        && ((TileEntityMultiBlockBase<?>) te).getListOfBlockPositions(currentPos).contains(this.pos))
+                 {
+                     setMaster((TE) te);
+                     ((TE) te).setMaster();
+diff --git a/src/main/java/cassiokf/industrialrenewal/util/MultiStackHandler.java b/src/main/java/cassiokf/industrialrenewal/util/MultiStackHandler.java
+index 5eacb50d..874c937b 100644
+--- a/src/main/java/cassiokf/industrialrenewal/util/MultiStackHandler.java
++++ b/src/main/java/cassiokf/industrialrenewal/util/MultiStackHandler.java
+@@ -1,6 +1,7 @@
+ package cassiokf.industrialrenewal.util;
+ 
+ import cassiokf.industrialrenewal.util.interfaces.ISync;
++import net.minecraft.init.Items;
+ import net.minecraft.item.ItemStack;
+ import net.minecraft.nbt.NBTTagCompound;
+ import net.minecraft.tileentity.TileEntity;
+@@ -29,9 +30,26 @@ public class MultiStackHandler extends ItemStackHandler
+     public ItemStack getStackInSlot(int slot)
+     {
+         validateSlotIndex(slot);
+-        ItemStack stack = this.stacks.get(slot);
+-        stack.setCount(count);
+-        return stack;
++        // patch: the internal stack is only the item "type" (count 1); return a copy with the real count.
++        // The old code mutated and returned the internal stack (and even ItemStack.EMPTY), so any caller
++        // modifying it, or a save while its size was 0, lost the item type -> whole rack content vanished.
++        ItemStack type = this.stacks.get(slot);
++        if (count <= 0 || type.isEmpty()) return ItemStack.EMPTY;
++        return ItemHandlerHelper.copyStackWithSize(type, count);
++    }
++
++    /**
++     * Clears the stored item type when the count dropped to zero (or below).
++     *
++     * @return nothing
++     */
++    private void clearIfEmpty()
++    {
++        if (count <= 0)
++        {
++            count = 0;
++            this.stacks.set(0, ItemStack.EMPTY);
++        }
+     }
+ 
+     public ItemStack insertItem(@Nonnull ItemStack stack)
+@@ -111,7 +129,7 @@ public class MultiStackHandler extends ItemStackHandler
+         if (existing.isEmpty())
+             return ItemStack.EMPTY;
+ 
+-        int toExtract = Math.min(amount, maxStack);
++        int toExtract = Math.min(amount, existing.getMaxStackSize());
+ 
+         if (count <= toExtract)
+         {
+@@ -149,13 +167,29 @@ public class MultiStackHandler extends ItemStackHandler
+     public void setCount(int value)
+     {
+         count = value;
++        clearIfEmpty();
+         onContentsChanged(0);
+     }
+ 
+     public void removeFromCount(int value)
+     {
+         count -= value;
++        clearIfEmpty();
++        onContentsChanged(0);
++    }
++
++    /**
++     * Removes everything from the handler.
++     *
++     * @return the removed contents as one stack with the full count (may exceed max stack size), or EMPTY
++     */
++    public ItemStack extractAll()
++    {
++        ItemStack all = getStackInSlot(0);
++        count = 0;
++        this.stacks.set(0, ItemStack.EMPTY);
+         onContentsChanged(0);
++        return all;
+     }
+ 
+     public void addToCount(int value)
+@@ -201,5 +235,11 @@ public class MultiStackHandler extends ItemStackHandler
+         sync = nbt.getBoolean("sync");
+         count = nbt.getInteger("count");
+         super.deserializeNBT(nbt);
++        // patch: old saves stored the internal stack with the real count truncated to a byte (e.g. 256 -> 0),
++        // which makes it "empty" although the item id is there. Keep the type (count 1) if items are stored.
++        ItemStack type = this.stacks.get(0);
++        if (type != ItemStack.EMPTY && type.getItem() != Items.AIR && count > 0)
++            type.setCount(1);
++        else if (count <= 0) this.stacks.set(0, ItemStack.EMPTY);
+     }
+ }
+-- 
+2.45.1.windows.1
+

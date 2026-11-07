@@ -34,15 +34,23 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 # Outputs: one line per mod on stdout
 #######################################
 read_manifest() {
+  local out=""
   if command -v jq >/dev/null 2>&1; then
-    jq -r '.mods[] | [.name,.original_file,.original_sha1,.patched_file,.url,.sha256] | join("|")' "$1"
-  elif command -v python3 >/dev/null 2>&1; then
-    python3 -I -c 'import json,sys
-for m in json.load(open(sys.argv[1]))["mods"]:
-    print("|".join([m["name"],m["original_file"],m["original_sha1"],m["patched_file"],m["url"],m["sha256"]]))' "$1"
-  else
-    die "need jq or python3 to read patches.json"
+    out=$(jq -r '.mods[] | [.name,.original_file,.original_sha1,.patched_file,.url,.sha256] | join("|")' "$1") || out=""
   fi
+  if [ -z "$out" ]; then
+    # python3/python may be a non-working stub (e.g. the Windows Store alias), so check the actual output
+    for py in python3 python; do
+      command -v "$py" >/dev/null 2>&1 || continue
+      out=$("$py" -I -c 'import json,sys
+for m in json.load(open(sys.argv[1]))["mods"]:
+    print("|".join([m["name"],m["original_file"],m["original_sha1"],m["patched_file"],m["url"],m["sha256"]]))' "$1" 2>/dev/null) || out=""
+      [ -n "$out" ] && break
+    done
+  fi
+  [ -n "$out" ] || return 1
+  # strip CR (python on Windows prints CRLF), otherwise the last field (sha256) never matches
+  printf '%s\n' "$out" | tr -d '\r'
 }
 
 #######################################
@@ -78,10 +86,12 @@ fi
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 curl -fsSL "$MANIFEST_URL" -o "$TMP/patches.json" || die "cannot download $MANIFEST_URL"
+read_manifest "$TMP/patches.json" > "$TMP/mods.txt" || die "cannot read patches.json (need jq or a working python3/python)"
+[ -s "$TMP/mods.txt" ] || die "patches.json lists no mods"
 
 if [ "$MODE" = "--check" ]; then
   while IFS='|' read -r name orig osha patched url sha; do
-    if [ -f "$MODS/$patched" ] && [ "$(sha256sum "$MODS/$patched" | cut -d' ' -f1)" = "$sha" ]; then
+    if [ -f "$MODS/$patched" ] && [ "$(sha256sum < "$MODS/$patched" | cut -c1-64)" = "$sha" ]; then
       echo "PATCHED   $name ($patched)"
     elif [ -f "$MODS/$patched" ]; then
       echo "OUTDATED  $name ($patched has a different hash)"
@@ -90,7 +100,7 @@ if [ "$MODE" = "--check" ]; then
     else
       echo "MISSING   $name"
     fi
-  done < <(read_manifest "$TMP/patches.json")
+  done < "$TMP/mods.txt"
   exit 0
 fi
 
@@ -100,14 +110,14 @@ BACKUP="$SERVER_DIR/mods-backup-$(date +%Y%m%d-%H%M%S)"
 CHANGED=0
 while IFS='|' read -r name orig osha patched url sha; do
   echo "== $name"
-  if [ -f "$MODS/$patched" ] && [ "$(sha256sum "$MODS/$patched" | cut -d' ' -f1)" = "$sha" ]; then
+  if [ -f "$MODS/$patched" ] && [ "$(sha256sum < "$MODS/$patched" | cut -c1-64)" = "$sha" ]; then
     echo "   already patched, skipping"; continue
   fi
   curl -fsSL "$url" -o "$TMP/$patched" || die "download failed: $url"
-  [ "$(sha256sum "$TMP/$patched" | cut -d' ' -f1)" = "$sha" ] || die "SHA-256 mismatch for $patched"
+  [ "$(sha256sum < "$TMP/$patched" | cut -c1-64)" = "$sha" ] || die "SHA-256 mismatch for $patched"
   mkdir -p "$BACKUP"
   if [ -f "$MODS/$orig" ]; then
-    [ "$(sha1sum "$MODS/$orig" | cut -d' ' -f1)" = "$osha" ] \
+    [ "$(sha1sum < "$MODS/$orig" | cut -c1-40)" = "$osha" ] \
       || die "$orig is not the original pack jar (unexpected SHA-1) - refusing to replace"
     mv -v "$MODS/$orig" "$BACKUP/"
   fi
@@ -115,6 +125,6 @@ while IFS='|' read -r name orig osha patched url sha; do
   [ -f "$MODS/$patched" ] && mv -v "$MODS/$patched" "$BACKUP/"
   cp -v "$TMP/$patched" "$MODS/$patched"
   CHANGED=1
-done < <(read_manifest "$TMP/patches.json")
+done < "$TMP/mods.txt"
 
 [ "$CHANGED" = 1 ] && echo "Done. Originals backed up in $BACKUP" || echo "Nothing to do."

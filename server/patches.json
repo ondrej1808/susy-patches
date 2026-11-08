@@ -1,14 +1,14 @@
 {
   "pack": "Supersymmetry",
   "pack_version": "0.2.0.1-patch2",
-  "patch_release": "v0.2.0.1-patch2-r2",
+  "patch_release": "v0.2.0.1-patch2-r3",
   "mods": [
     {
       "name": "GregTech CEu",
       "original_file": "gregtech-1.12.2-2.8.10-beta.jar",
       "original_sha1": "0c72d4b7b87092d4068c3cb660c95c2c845174c1",
       "patched_file": "gregtech-1.12.2-2.8.10-beta-susypatch.jar",
-      "url": "https://github.com/ondrej1808/susy-patches/releases/download/v0.2.0.1-patch2-r2/gregtech-1.12.2-2.8.10-beta-susypatch.jar",
+      "url": "https://github.com/ondrej1808/susy-patches/releases/download/v0.2.0.1-patch2-r3/gregtech-1.12.2-2.8.10-beta-susypatch.jar",
       "sha256": "37ecdd74bd492ee1c9ee652e081803ab9986efd0eba085206bddad1b43389c16"
     },
     {
@@ -16,8 +16,8 @@
       "original_file": "IndustrialRenewal_1.12.2-0.21.8.jar",
       "original_sha1": "3d3d77cc3eb341200c81e0c3ef2dec69ffc69521",
       "patched_file": "IndustrialRenewal_1.12.2-0.21.8-susypatch.jar",
-      "url": "https://github.com/ondrej1808/susy-patches/releases/download/v0.2.0.1-patch2-r2/IndustrialRenewal_1.12.2-0.21.8-susypatch.jar",
-      "sha256": "1d36461f31a0e808a95d12a8db725de063fc31741a732231affc7b851596978f"
+      "url": "https://github.com/ondrej1808/susy-patches/releases/download/v0.2.0.1-patch2-r3/IndustrialRenewal_1.12.2-0.21.8-susypatch.jar",
+      "sha256": "d0494e7c79bf8b2151a293a3d7bb1b94cb849b337562d6423a4e99c116809dc0"
     }
   ]
 }

@@ -1,7 +1,7 @@
 From de4564f5435cc11b5ee3e82f4dffb39f1f020407 Mon Sep 17 00:00:00 2001
 From: ondrej1808 <o.hlav@post.cz>
 Date: Sat, 7 Nov 2026 12:59:47 +0100
-Subject: [PATCH 1/2] Storage Rack/Chest: fix item loss on stacking/breaking,
+Subject: [PATCH 1/4] Storage Rack/Chest: fix item loss on stacking/breaking,
  top-face access, chest GUI scroll+search
 
 - TEMultiTankBase: resolve the whole stack at once (correct bottom/top for every member),
@@ -956,7 +956,7 @@ index 5eacb50d..874c937b 100644
 From fa7d1e9dab462b9fc0e53ee97c7bbee2bcfdfa1d Mon Sep 17 00:00:00 2001
 From: ondrej1808 <o.hlav@post.cz>
 Date: Sat, 7 Nov 2026 13:21:45 +0100
-Subject: [PATCH 2/2] Storage Chest GUI: handle mouse wheel before Mouse
+Subject: [PATCH 2/4] Storage Chest GUI: handle mouse wheel before Mouse
  Tweaks; translate analysis to English
 
 - Wheel over chest slots/scrollbar is consumed in the earliest GuiScreenEvent.MouseInputEvent.Pre
@@ -1155,6 +1155,112 @@ index 84f7f0bc..0682ce77 100644
      @SideOnly(Side.CLIENT)
      @SubscribeEvent
      public static void onRenderGui(RenderGameOverlayEvent.Post event)
+-- 
+2.45.1.windows.1
+
+
+From cfd402322b4132d03b5fafeb663459e011b89fdf Mon Sep 17 00:00:00 2001
+From: ondrej1808 <o.hlav@post.cz>
+Date: Sat, 7 Nov 2026 13:24:07 +0100
+Subject: [PATCH 3/4] Add unofficial / use-at-your-own-risk notice
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ PATCH_STORAGE_RACK.md | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/PATCH_STORAGE_RACK.md b/PATCH_STORAGE_RACK.md
+index 649245df..dfae2f06 100644
+--- a/PATCH_STORAGE_RACK.md
++++ b/PATCH_STORAGE_RACK.md
+@@ -1,5 +1,8 @@
+ # Storage Rack / Storage Chest – analysis and patch (IR 0.21.8, SuSy 0.2.0.1-patch2)
+ 
++> [!WARNING]
++> **UNOFFICIAL PATCH – USE AT YOUR OWN RISK.** Not made, endorsed or supported by the authors of Supersymmetry, GregTech CEu or Industrial Renewal. No warranty of any kind. Back up your world before using it.
++
+ ## Model
+ Every rack (3×3 footprint, 3 blocks tall) has a master TE. Racks stacked on top of each other (master exactly
+ 3 blocks higher) form a "stack". The shared contents are held **only by the bottom** member (`bottomTE`),
+-- 
+2.45.1.windows.1
+
+
+From ec93ef9fdf9b12d4901e0b39c1ba602112035806 Mon Sep 17 00:00:00 2001
+From: ondrej1808 <o.hlav@post.cz>
+Date: Sun, 8 Nov 2026 12:08:52 +0100
+Subject: [PATCH 4/4] Storage Chest GUI: disable Mouse Tweaks wheel tweak via
+ its official API annotation
+
+Mouse Tweaks does not use the Forge mouse event that the previous fix cancelled, so the wheel over chest
+slots still moved items. GUIStorageChest is now annotated with @MouseTweaksDisableWheelTweak; a compile-time
+stub of the annotation is excluded from the built jar (the real class comes from Mouse Tweaks at runtime).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build.gradle                                    |  5 +++++
+ .../industrialrenewal/gui/GUIStorageChest.java  |  6 ++++++
+ .../api/MouseTweaksDisableWheelTweak.java       | 17 +++++++++++++++++
+ 3 files changed, 28 insertions(+)
+ create mode 100644 src/main/java/yalter/mousetweaks/api/MouseTweaksDisableWheelTweak.java
+
+diff --git a/build.gradle b/build.gradle
+index 48c96507..3cb52be5 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -77,3 +77,8 @@ processResources {
+         exclude 'mcmod.info'
+     }
+ }
++
++// patch: Mouse Tweaks API annotation is only a compile-time stub; the real class comes from the Mouse Tweaks mod
++jar {
++    exclude 'yalter/**'
++}
+diff --git a/src/main/java/cassiokf/industrialrenewal/gui/GUIStorageChest.java b/src/main/java/cassiokf/industrialrenewal/gui/GUIStorageChest.java
+index 9b180567..89541483 100644
+--- a/src/main/java/cassiokf/industrialrenewal/gui/GUIStorageChest.java
++++ b/src/main/java/cassiokf/industrialrenewal/gui/GUIStorageChest.java
+@@ -21,10 +21,16 @@ import net.minecraft.item.ItemStack;
+ import net.minecraftforge.client.event.GuiScreenEvent;
+ import org.lwjgl.input.Keyboard;
+ import org.lwjgl.input.Mouse;
++import yalter.mousetweaks.api.MouseTweaksDisableWheelTweak;
+ 
+ import java.util.ArrayList;
+ import java.util.Locale;
+ 
++/**
++ * Storage Chest GUI. Patch: Mouse Tweaks' wheel tweak is disabled here, so the wheel scrolls the chest pages
++ * instead of moving items between the chest and the player inventory.
++ */
++@MouseTweaksDisableWheelTweak
+ public class GUIStorageChest extends GUIBase
+ {
+     private final TEStorageChest te;
+diff --git a/src/main/java/yalter/mousetweaks/api/MouseTweaksDisableWheelTweak.java b/src/main/java/yalter/mousetweaks/api/MouseTweaksDisableWheelTweak.java
+new file mode 100644
+index 00000000..e519a217
+--- /dev/null
++++ b/src/main/java/yalter/mousetweaks/api/MouseTweaksDisableWheelTweak.java
+@@ -0,0 +1,17 @@
++package yalter.mousetweaks.api;
++
++import java.lang.annotation.ElementType;
++import java.lang.annotation.Retention;
++import java.lang.annotation.RetentionPolicy;
++import java.lang.annotation.Target;
++
++/**
++ * Compile-time stub of Mouse Tweaks' API annotation (same name and retention as in
++ * mousetweaks-1.12.2-3.x). Excluded from the built jar (see build.gradle): at runtime the real class from the
++ * Mouse Tweaks mod is used; without Mouse Tweaks installed the JVM simply ignores the annotation.
++ */
++@Retention(RetentionPolicy.RUNTIME)
++@Target(ElementType.TYPE)
++public @interface MouseTweaksDisableWheelTweak
++{
++}
 -- 
 2.45.1.windows.1
 
